@@ -1,0 +1,109 @@
+#!/usr/bin/env ruby
+require 'docker-api'
+require 'sinatra'
+require 'pp'
+
+set :bind, '0.0.0.0'
+set :port, 21081
+set :lock, true # disable concurrent access.
+
+def log(io, *args)
+  io.puts *args
+  io.flush
+end
+
+# periodically check downed worker node to clean up
+def refresh
+  Sinatra::Base.send :synchronize do
+    json = Docker.connection.get '/nodes', filters:{role:["worker"]}.to_json
+    Docker::Util.parse_json(json).select do |node|
+      node.dig('Status', 'State').to_s.downcase == 'down'
+    end.each do |node|
+      if name = node.dig('Description', 'Hostname')
+        log STDOUT, "[I] worker node '#{name}' is down. removing."
+        Docker.connection.delete "/nodes/#{node['ID']}"
+      end
+    end
+  end
+rescue Exception => e
+  log STDERR, "[E] failed to refresh: #{e}"
+end
+
+def node_for(host)
+  json = Docker.connection.get '/nodes', filters:{name:[host]}.to_json
+  Docker::Util.parse_json(json).first
+end
+
+# [id, version, spec]
+def service_for(name)
+  json = Docker.connection.get '/services', filters:{name:[name]}.to_json
+  s = Docker::Util.parse_json(json).first
+  [s['ID'], s.dig('Version', 'Index'), s['Spec']]
+end
+
+def tasks_for(name)
+  json = Docker.connection.get '/tasks',
+    filters:{service:[name], 'desired-state': ['running']}.to_json
+  Docker::Util.parse_json(json)
+end
+
+get '/update/*' do |args|
+  logger.info "update: #{args}"
+  args.split('/').each do |name|
+    sid, version, spec = service_for name 
+    if n = spec.dig('Mode', 'Replicated', 'Replicas')
+      n = n.to_i
+      # increase the scale
+      spec['Mode']['Replicated']['Replicas'] = n + 1
+      logger.info "spin up #{name}: #{n} -> #{n + 1}"
+      Docker.connection.post "/services/#{sid}/update",
+        {version: version, registryAuthFrom: 'previous-spec'},
+        body: spec.to_json
+
+      # wait for (n + 1)-th replica
+      60.times do
+        logger.info "Waiting for #{n+1}-th replica..."
+        tasks = tasks_for sid
+        if tasks.size > n
+          logger.info "Found #{n + 1} replicas."
+          break
+        end
+        sleep 1
+      end
+
+      # reduce the scale
+      sid, version, spec = service_for name
+      spec['Mode']['Replicated']['Replicas'] = n
+      logger.info "spin down #{name}: #{n + 1} -> #{n}"
+      Docker.connection.post "/services/#{sid}/update",
+        {version: version, registryAuthFrom: 'previous-spec'},
+        body: spec.to_json
+    end
+  end
+  'ok'
+end
+
+get '/drain/:host' do |host|
+  logger.info "drain: #{host}"
+  if node = node_for(host)
+    version = node.dig 'Version', 'Index'
+    spec = node['Spec']
+    # mark node drain
+    spec['Availability'] = 'drain'
+    Docker.connection.post "/nodes/#{node['ID']}/update",
+      {version: version}, body: spec.to_json
+  end
+  'ok'
+end
+
+error do |e|
+  log STDERR, "[E] error: #{e}"
+end
+
+log STDOUT, Docker.version.pretty_inspect
+Thread.new do
+  loop do
+    refresh
+    sleep ENV['INTERVAL'].to_f
+  end
+end
