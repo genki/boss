@@ -3,14 +3,13 @@ Boss for docker services
 
 **USAGE**
 
-start the service.
-
-```
-docker service create --name boss -p 21081:21081 \
-  --constraint node.role==manager \
-  --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
-  s21g/boss
-```
+* start the service.
+  ```
+  docker service create --name boss -p 21081:21081 \
+    --constraint node.role==manager \
+    --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+    s21g/boss
+  ```
 
 * Notify the addition of a worker node to the boss from the `startup script` of VM instance.
   ```
